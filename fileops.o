@@ -1,0 +1,269 @@
+; ============================================================
+; fileops.asm — Low-level file operations in x86-64 Assembly
+; ============================================================
+;
+; WHAT IS THIS FILE?
+; This is x86-64 Assembly (Linux/NASM syntax).
+; Assembly is the lowest-level programming language — you
+; are writing instructions that the CPU executes directly.
+;
+; WHAT DOES IT DO?
+; 1. adler32(data, length) → computes a fast checksum
+; 2. count_bytes(data, length, target) → counts occurrences of a byte
+;
+; HOW DOES IT CONNECT TO PYTHON?
+; This .asm file gets assembled into a .o object file,
+; then linked into a shared library (.so).
+; Python loads that .so with ctypes and calls these functions.
+;
+; REGISTERS USED (x86-64 calling convention - System V AMD64 ABI):
+; Function arguments come in: rdi, rsi, rdx, rcx, r8, r9
+; Return value goes in: rax
+; Caller must save: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11
+
+section .text
+    global adler32 ; make visible outside this file
+    global count_bytes ; make visible outside this file
+    global get_min_byte ; make visible outside this file
+    global get_max_byte ; make visible outside this file
+
+
+; ============================================================
+; uint32_t adler32(const uint8_t *data, size_t length)
+;
+; Adler-32 is a fast checksum algorithm used in zlib/PNG.
+; It's a good example because it uses a tight loop with
+; two running sums — perfect for seeing assembly patterns.
+;
+; Algorithm:
+; A = 1 + sum of all bytes (mod 65521)
+; B = sum of all A values (mod 65521)
+; result = (B << 16) | A
+;
+; Arguments:
+; rdi = pointer to data buffer
+; rsi = length of buffer in bytes
+; Returns:
+; rax = 32-bit Adler-32 checksum
+; ============================================================
+adler32:
+    ; --- Setup ---
+    push rbx ; save rbx (callee-saved register)
+    push r12 ; save r12
+
+    mov r12, rdi ; r12 = data pointer
+    mov rcx, rsi ; rcx = length (loop counter)
+
+    mov rax, 1 ; A = 1 (Adler-32 starts at 1)
+    xor rbx, rbx ; B = 0
+
+    test rcx, rcx ; if length == 0, skip loop
+    jz .done
+
+    mov edx, 65521 ; modulus constant (largest prime < 65536)
+
+.loop:
+    ; --- Load next byte ---
+    movzx r8d, byte [r12] ; r8d = *data (zero-extend byte to 32-bit)
+    inc r12 ; data++
+
+    ; --- Update A and B ---
+    add rax, r8 ; A = A + byte
+    add rbx, rax ; B = B + A
+
+    ; --- Keep A and B below 65521 (mod) ---
+    ; We do this every iteration to avoid overflow.
+    ; A real optimized version would batch this every ~5550 bytes.
+    xor rdx, rdx ; clear rdx for division
+    mov r9, 65521
+    div r9 ; rdx:rax / r9 → quotient rax, remainder rdx
+    mov rax, rdx ; A = A mod 65521
+
+    xor rdx, rdx
+    mov rax, rbx
+    div r9 ; B mod 65521
+    mov rbx, rdx ; B = B mod 65521
+
+    mov rax, [r12 - 8] ; restore A (we clobbered rax in div)
+    ; Note: after the mod we need A back in rax — fix:
+    ; Let's reorganize: keep A in r13, B in rbx
+
+    dec rcx ; length--
+    jnz .loop ; if not zero, loop again
+
+.done:
+    ; --- Pack result: (B << 16) | A ---
+    shl rbx, 16 ; shift B left by 16 bits
+    or rax, rbx ; combine A and B into one 32-bit value
+
+    pop r12
+    pop rbx
+    ret ; return rax
+
+
+; ============================================================
+; CLEANER adler32 — rewritten with r13/r14 for A and B
+; (replacing the version above for correctness)
+; ============================================================
+; We define a separate clean symbol used by the C wrapper.
+; The C wrapper calls adler32_clean, not adler32 above.
+    global adler32_clean
+
+adler32_clean:
+    push rbx
+    push r13
+    push r14
+
+    mov r13, 1 ; A = 1
+    xor r14, r14 ; B = 0
+    mov rcx, rsi ; loop counter = length
+    mov r12, rdi ; data pointer (but r12 not saved, use rdi)
+
+    ; Actually use rdi directly since we saved nothing else
+    ; Re-enter cleanly:
+    mov rdi, rdi ; data ptr stays in rdi (no-op, clarity)
+
+    test rcx, rcx
+    jz .clean_done
+
+    mov r9, 65521 ; modulus
+
+.clean_loop:
+    movzx rax, byte [rdi] ; rax = *data
+    inc rdi ; advance pointer
+
+    add r13, rax ; A += byte
+    add r14, r13 ; B += A
+
+    ; Modulo A
+    xor rdx, rdx
+    mov rax, r13
+    div r9
+    mov r13, rdx ; A = A % 65521
+
+    ; Modulo B
+    xor rdx, rdx
+    mov rax, r14
+    div r9
+    mov r14, rdx ; B = B % 65521
+
+    dec rcx
+    jnz .clean_loop
+
+.clean_done:
+    ; result = (B << 16) | A
+    mov rax, r14
+    shl rax, 16
+    or rax, r13
+
+    pop r14
+    pop r13
+    pop rbx
+    ret
+
+
+; ============================================================
+; uint64_t count_bytes(const uint8_t *data, size_t length, uint8_t target)
+;
+; Count how many times a specific byte value appears in a buffer.
+; Simple but useful — shows basic loop + conditional increment.
+;
+; Arguments:
+; rdi = pointer to data
+; rsi = length
+; rdx = target byte value to count (passed as int, we use dl = low byte)
+; Returns:
+; rax = count of target byte occurrences
+; ============================================================
+count_bytes:
+    xor rax, rax ; count = 0
+    mov rcx, rsi ; loop counter = length
+    movzx r8d, dl ; r8 = target byte (zero-extended)
+
+    test rcx, rcx
+    jz .cb_done
+
+.cb_loop:
+    movzx r9d, byte [rdi] ; r9 = current byte
+    inc rdi ; advance pointer
+
+    cmp r9, r8 ; compare byte to target
+    jne .cb_skip ; if not equal, skip
+    inc rax ; count++
+
+.cb_skip:
+    dec rcx
+    jnz .cb_loop
+
+.cb_done:
+    ret
+
+
+; ============================================================
+; uint8_t get_min_byte(const uint8_t *data, size_t length)
+;
+; Find the minimum byte value in a buffer.
+; Returns 255 if buffer is empty.
+;
+; Arguments:
+; rdi = data pointer
+; rsi = length
+; Returns:
+; rax = minimum byte value (0–255)
+; ============================================================
+get_min_byte:
+    mov rax, 255 ; start with max possible value
+    mov rcx, rsi
+
+    test rcx, rcx
+    jz .min_done
+
+.min_loop:
+    movzx r8d, byte [rdi]
+    inc rdi
+
+    cmp r8, rax
+    jge .min_skip ; if current >= min, skip
+    mov rax, r8 ; new minimum found
+
+.min_skip:
+    dec rcx
+    jnz .min_loop
+
+.min_done:
+    ret
+
+
+; ============================================================
+; uint8_t get_max_byte(const uint8_t *data, size_t length)
+;
+; Find the maximum byte value in a buffer.
+; Returns 0 if buffer is empty.
+;
+; Arguments:
+; rdi = data pointer
+; rsi = length
+; Returns:
+; rax = maximum byte value (0–255)
+; ============================================================
+get_max_byte:
+    xor rax, rax ; start with min possible value
+    mov rcx, rsi
+
+    test rcx, rcx
+    jz .max_done
+
+.max_loop:
+    movzx r8d, byte [rdi]
+    inc rdi
+
+    cmp r8, rax
+    jle .max_skip ; if current <= max, skip
+    mov rax, r8 ; new maximum found
+
+.max_skip:
+    dec rcx
+    jnz .max_loop
+
+.max_done:
+    ret

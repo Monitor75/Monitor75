@@ -1,0 +1,134 @@
+/*
+ * wrapper.c — C bridge between Assembly and Python
+ * =================================================
+ *
+ * WHY DO WE NEED THIS FILE?
+ * Python's ctypes can call C functions directly.
+ * It's easier (and safer) to have C handle:
+ * - Opening and reading files from disk
+ * - Allocating/freeing memory buffers
+ * - Calling the assembly functions with correct types
+ * - Packing results into structs Python can read
+ *
+ * HOW IT WORKS:
+ * 1. Python calls inspect_file("path/to/file.txt")
+ * 2. C opens the file, reads it into a buffer
+ * 3. C calls the assembly functions (adler32_clean, count_bytes, etc.)
+ * 4. C fills a FileStats struct with the results
+ * 5. Python reads the struct fields via ctypes
+ *
+ * COMPILATION:
+ * See Makefile — the .asm is assembled first, then linked with this .c
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
+/* -------------------------------------------------------
+ * Declarations of our Assembly functions.
+ * "extern" means: "this function is defined somewhere else"
+ * (in fileops.asm, assembled into fileops.o)
+ * ------------------------------------------------------- */
+extern uint32_t adler32_clean(const uint8_t *data, size_t length);
+extern uint64_t count_bytes(const uint8_t *data, size_t length, uint8_t target);
+extern uint8_t get_min_byte(const uint8_t *data, size_t length);
+extern uint8_t get_max_byte(const uint8_t *data, size_t length);
+
+
+/* -------------------------------------------------------
+ * FileStats — a struct holding all inspection results.
+ *
+ * Python will mirror this struct with ctypes.Structure
+ * so it can read each field by name.
+ * ------------------------------------------------------- */
+typedef struct {
+    uint32_t adler32; /* checksum of the entire file */
+    uint64_t file_size; /* total bytes */
+    uint64_t null_bytes; /* count of 0x00 bytes */
+    uint64_t newline_bytes; /* count of '\n' (0x0A) bytes */
+    uint64_t printable_bytes; /* count of bytes 0x20–0x7E (visible ASCII) */
+    uint8_t min_byte; /* smallest byte value found */
+    uint8_t max_byte; /* largest byte value found */
+    uint8_t is_text; /* 1 if >90% bytes are printable ASCII, 0 otherwise */
+    uint8_t _pad[1]; /* padding for alignment */
+} FileStats;
+
+
+/* -------------------------------------------------------
+ * inspect_file(path, out_stats)
+ *
+ * Opens a file, reads it into memory, calls assembly
+ * functions to compute stats, fills the FileStats struct.
+ *
+ * Returns:
+ * 0 on success
+ * -1 if file cannot be opened
+ * -2 if memory allocation fails
+ * ------------------------------------------------------- */
+int inspect_file(const char *path, FileStats *out) {
+    /* --- Open the file --- */
+    FILE *fp = fopen(path, "rb"); /* "rb" = read binary (important on Windows) */
+    if (!fp) return -1;
+
+    /* --- Find file size --- */
+    fseek(fp, 0, SEEK_END); /* jump to end */
+    long size = ftell(fp); /* get position = file size */
+    rewind(fp); /* jump back to start */
+
+    if (size <= 0) {
+        fclose(fp);
+        /* Empty file — fill with zeros and return */
+        memset(out, 0, sizeof(FileStats));
+        out->adler32 = 1; /* Adler-32 of empty input is 1 */
+        return 0;
+    }
+
+    /* --- Allocate buffer and read file --- */
+    uint8_t *buf = (uint8_t *)malloc(size);
+    if (!buf) {
+        fclose(fp);
+        return -2;
+    }
+
+    fread(buf, 1, size, fp);
+    fclose(fp);
+
+    /* --- Call Assembly functions --- */
+    out->adler32 = adler32_clean(buf, size);
+    out->file_size = (uint64_t)size;
+    out->null_bytes = count_bytes(buf, size, 0x00);
+    out->newline_bytes = count_bytes(buf, size, 0x0A);
+    out->min_byte = get_min_byte(buf, size);
+    out->max_byte = get_max_byte(buf, size);
+
+    /* --- Count printable ASCII bytes (space 0x20 to tilde 0x7E) --- */
+    uint64_t printable = 0;
+    for (long i = 0; i < size; i++) {
+        if (buf[i] >= 0x20 && buf[i] <= 0x7E) {
+            printable++;
+        }
+    }
+    out->printable_bytes = printable;
+
+    /* --- Heuristic: is this a text file? --- */
+    /* If more than 90% of bytes are printable ASCII, treat as text */
+    out->is_text = (printable * 100 / size) >= 90 ? 1 : 0;
+
+    free(buf);
+    return 0;
+}
+
+
+/* -------------------------------------------------------
+ * get_file_checksum(path) — convenience function
+ *
+ * Just returns the Adler-32 checksum of a file.
+ * Returns 0 on error.
+ * ------------------------------------------------------- */
+uint32_t get_file_checksum(const char *path) {
+    FileStats stats;
+    if (inspect_file(path, &stats) != 0) return 0;
+    return stats.adler32;
+}
