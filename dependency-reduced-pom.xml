@@ -1,0 +1,43 @@
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import storage.StorageNodeServiceGrpc;
+import storage.StorageProto.*;
+
+public class StorageNodeClient {
+    private final String nodeAddr;
+    private final ManagedChannel channel;
+    private final StorageNodeServiceGrpc.StorageNodeServiceBlockingStub stub;
+
+    public StorageNodeClient(String nodeAddr) {
+        this.nodeAddr = nodeAddr;
+        this.channel = ManagedChannelBuilder.forTarget(nodeAddr).usePlaintext().build();
+        this.stub = StorageNodeServiceGrpc.newBlockingStub(channel);
+    }
+
+    public StoreChunkResponse storeChunk(String chunkId, byte[] data) {
+        StoreChunkRequest request = StoreChunkRequest.newBuilder()
+            .setChunkId(chunkId)
+            .setData(com.google.protobuf.ByteString.copyFrom(data))
+            .build();
+        return stub.storeChunk(request);
+    }
+
+    public ChunkData retrieveChunk(String chunkId) {
+        RetrieveChunkRequest request = RetrieveChunkRequest.newBuilder()
+            .setChunkId(chunkId)
+            .build();
+        return stub.retrieveChunk(request);
+    }
+
+    public ReplicateChunkResponse replicateChunk(String chunkId, String sourceNode) {
+        ReplicateChunkRequest request = ReplicateChunkRequest.newBuilder()
+            .setChunkId(chunkId)
+            .setTargetNode(sourceNode)
+            .build();
+        return stub.replicateChunk(request);
+    }
+
+    public void close() {
+        channel.shutdown();
+    }
+}
